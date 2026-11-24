@@ -1,0 +1,14 @@
+# Do NOT list torch, torchvision or transformers here: they come from the ROCm base
+# image (transformers is upgraded separately with --no-deps in the Dockerfile).
+# Merge with your existing requirements.txt from the previous challenge.
+httpx
+beautifulsoup4
+lxml
+pdfplumber
+pypdf
+pillow
+playwright
+greenlet
+pyee
+accelerate
+qwen-vl-utils
