@@ -12,3 +12,11 @@ greenlet
 pyee
 accelerate
 qwen-vl-utils
+typer
+regex
+tqdm
+pyyaml
+filelock
+requests
+packaging
+numpy

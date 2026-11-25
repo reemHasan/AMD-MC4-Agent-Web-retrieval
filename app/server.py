@@ -14,6 +14,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 SOCK = "/tmp/agent.sock"
 MODEL_DIR = os.environ.get("MC3_MODEL_DIR", "/models/vlm")
+DEBUG = os.environ.get("AGENT_DEBUG") == "1"
 MAX_STEPS = 6
 DEADLINE = 24          # seconds per question (hard limit is 30)
 CTX_CHARS = 5000       # page text sent to the model per step
@@ -105,6 +106,8 @@ def parse(url, html):
     soup = BeautifulSoup(html, "html.parser")
     for t in soup(["script", "style", "noscript", "svg", "footer"]):
         t.decompose()
+    for a in soup.find_all("a", title=True):  # visible text is often truncated; title has the full text
+        a.string = a["title"]
     for tr in soup.find_all("tr"):  # keep table rows readable
         tr.append(" | ".join(c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])) + "\n")
     text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
@@ -156,10 +159,14 @@ def answer(url, query):
         visited.add(url)
         text, links = parse(url, fetch_html(url))
         if not text:
+            if DEBUG:
+                print(f"[step] empty text for {url}", flush=True)
             break
         link_list = "\n".join(f"- {t} -> {u}" for t, u in rank_links(links, query))
         user = f"Question: {query}\n\nPAGE URL: {url}\nPAGE TEXT:\n{select_context(text, query)}\n\nLINKS:\n{link_list}"
         out = llm_json(SYSTEM, user)
+        if DEBUG:
+            print(f"[step] url={url} text_len={len(text)} out={out}", flush=True)
         if out is None:
             break
         # Verification gate: evidence must literally appear on the page and contain the value
