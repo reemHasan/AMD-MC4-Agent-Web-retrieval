@@ -4,7 +4,7 @@ Loads the model + browser once, then answers one question at a time over a unix 
 Request : {"url": "...", "query": "..."}\n
 Response: {"answer": "...", "citations": [...], "confidence": 0.9}\n
 """
-import json, os, re, socketserver, time
+import json, os, re, socketserver, time, unicodedata
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -121,8 +121,28 @@ def parse(url, html):
 
 
 # ---------------------------------------------------------------- helpers
+_PUNCT = str.maketrans({"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'",
+                        "\u2013": "-", "\u2014": "-", "\u00a0": " "})
+
+
 def norm(s):
+    s = unicodedata.normalize("NFKC", s).translate(_PUNCT)
     return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def loose(s):
+    """Letters and digits only: ignores quotes style, dashes, spacing, punctuation."""
+    return re.sub(r"[\W_]+", "", norm(s))
+
+
+def verified(out, text):
+    """The evidence must really be on the page, and must contain the answer value."""
+    ev, val = out["evidence"], out["value"]
+    if not out["found"] or not val.strip() or len(loose(ev)) < 3:
+        return False
+    if loose(ev) not in loose(text):
+        return False
+    return norm(val) in norm(ev) or loose(val) in loose(ev)
 
 
 def tokens(s):
@@ -170,8 +190,7 @@ def answer(url, query):
         if out is None:
             break
         # Verification gate: evidence must literally appear on the page and contain the value
-        if out["found"] and out["value"].strip() and norm(out["evidence"]) in norm(text) \
-                and norm(out["value"]) in norm(out["evidence"]):
+        if verified(out, text):
             # TODO multi-hop: cite only pages that contributed a needed fact
             return {"answer": out["value"].strip(), "citations": [url], "confidence": 0.9}
         if out["found"]:
