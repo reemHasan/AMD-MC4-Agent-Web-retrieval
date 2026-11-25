@@ -18,6 +18,9 @@ DEBUG = os.environ.get("AGENT_DEBUG") == "1"
 MAX_STEPS = 6
 DEADLINE = 24          # seconds per question (hard limit is 30)
 CTX_CHARS = 5000       # page text sent to the model per step
+OPEN_BUDGET = 25       # total seconds when no URL is given (discovery + candidates)
+PER_CANDIDATE = 9      # max seconds spent on one candidate start page
+MAX_CANDIDATES = 4
 
 EMPTY = {"answer": "", "citations": []}
 
@@ -171,10 +174,10 @@ def rank_links(links, query, k=40):
 
 
 # ---------------------------------------------------------------- agent
-def answer(url, query):
+def answer(url, query, budget=DEADLINE):
     start, visited = time.time(), set()
     for _ in range(MAX_STEPS):
-        if time.time() - start > DEADLINE or not url or url in visited:
+        if time.time() - start > budget or not url or url in visited:
             break
         visited.add(url)
         text, links = parse(url, fetch_html(url))
@@ -199,12 +202,71 @@ def answer(url, query):
     return dict(EMPTY)
 
 
+# ---------------------------------------------------------------- open mode (no URL given)
+SITES_SYSTEM = (
+    "You help locate websites. Given a question, list up to 4 start URLs of official or "
+    "authoritative websites most likely to contain the answer, most likely first. Use a homepage "
+    "or a relevant section URL. This only decides WHERE TO LOOK; do not answer the question.\n"
+    'Reply with ONLY a JSON object: {"urls": ["https://...", "https://..."]}'
+)
+
+
+def clean_urls(urls):
+    out, seen = [], set()
+    for u in urls:
+        if not isinstance(u, str):
+            continue
+        u = u.strip()
+        if u and not u.startswith("http"):
+            u = "https://" + u
+        p = urlparse(u)
+        if p.scheme in ("http", "https") and "." in p.netloc and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out[:MAX_CANDIDATES]
+
+
+def propose_sites(query):
+    """Candidate start URLs. The model's knowledge only chooses where to look; every answer
+    must still pass the page-evidence check."""
+    for _ in range(2):
+        raw = generate(SITES_SYSTEM, f"Question: {query}", max_new_tokens=120)
+        m = re.search(r"\{.*\}", raw, re.S)
+        if m:
+            try:
+                return clean_urls(json.loads(m.group(0)).get("urls", []))
+            except Exception:
+                pass
+    return []
+
+
+def discover(query):
+    """Hook for candidate sources. Add search-engine / Wikipedia routes here later."""
+    return propose_sites(query)
+
+
+def answer_open(query):
+    start = time.time()
+    candidates = discover(query)
+    if DEBUG:
+        print(f"[open] candidates={candidates} after {time.time() - start:.1f}s", flush=True)
+    for url in candidates:
+        remaining = OPEN_BUDGET - (time.time() - start)
+        if remaining < 3:
+            break
+        res = answer(url, query, budget=min(PER_CANDIDATE, remaining))
+        if res["answer"]:
+            return res
+    return dict(EMPTY)
+
+
 # ---------------------------------------------------------------- socket server
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
         try:
             req = json.loads(self.rfile.readline())
-            res = answer(req["url"], req["query"])
+            url = (req.get("url") or "").strip()
+            res = answer(url, req["query"]) if url else answer_open(req["query"])
         except Exception as e:
             print("error:", e, flush=True)
             res = dict(EMPTY)
