@@ -5,7 +5,7 @@ Request : {"url": "...", "query": "..."}\n
 Response: {"answer": "...", "citations": [...], "confidence": 0.9}\n
 """
 import json, os, re, socketserver, time, unicodedata
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 import torch
@@ -20,7 +20,8 @@ DEADLINE = 24          # seconds per question (hard limit is 30)
 CTX_CHARS = 5000       # page text sent to the model per step
 OPEN_BUDGET = 25       # total seconds when no URL is given (discovery + candidates)
 PER_CANDIDATE = 9      # max seconds spent on one candidate start page
-MAX_CANDIDATES = 4
+MAX_CANDIDATES = 4      # from the model
+MAX_TOTAL = 5           # after merging with Wikipedia hits
 
 EMPTY = {"answer": "", "citations": []}
 
@@ -89,9 +90,13 @@ def fetch_html(url):
     try:
         r = httpx.get(url, timeout=8, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
         html = r.text
+        if DEBUG:
+            print(f"[fetch] {url} status={r.status_code} len={len(html)}", flush=True)
         if len(BeautifulSoup(html, "html.parser").get_text(" ", strip=True)) > 400 or BROWSER is None:
             return html
-    except Exception:
+    except Exception as e:
+        if DEBUG:
+            print(f"[fetch] {url} httpx failed: {e}", flush=True)
         if BROWSER is None:
             return ""
     try:  # JS-heavy page: render it
@@ -101,7 +106,9 @@ def fetch_html(url):
             return page.content()
         finally:
             page.close()
-    except Exception:
+    except Exception as e:
+        if DEBUG:
+            print(f"[fetch] {url} chromium failed: {e}", flush=True)
         return ""
 
 
@@ -152,20 +159,22 @@ def tokens(s):
     return set(re.findall(r"\w{3,}", s.lower()))
 
 
-def select_context(text, query, limit=CTX_CHARS, size=700):
-    """Keep the chunks most related to the query (lexical overlap), in original order."""
+def select_context(text, query, limit=CTX_CHARS, size=700, head=1200):
+    """Always keep the start of the page (title, author, headline facts), then the chunks of
+    the rest that best overlap the query, in original order."""
     if len(text) <= limit:
         return text
-    chunks = [text[i:i + size] for i in range(0, len(text), size)]
+    top, rest = text[:head], text[head:]
+    chunks = [rest[i:i + size] for i in range(0, len(rest), size)]
     q = tokens(query)
     ranked = sorted(range(len(chunks)), key=lambda i: -len(q & tokens(chunks[i])))
-    keep, total = [], 0
+    keep, total = [], len(top)
     for i in ranked:
         if total + len(chunks[i]) > limit:
             break
         keep.append(i)
         total += len(chunks[i])
-    return " ... ".join(chunks[i] for i in sorted(keep))
+    return " ... ".join([top] + [chunks[i] for i in sorted(keep)])
 
 
 def rank_links(links, query, k=40):
@@ -240,9 +249,33 @@ def propose_sites(query):
     return []
 
 
+def wikipedia_candidates(query, n=2):
+    """Top Wikipedia articles for the question (stable API, allows automated use)."""
+    try:
+        r = httpx.get(
+            "https://en.wikipedia.org/w/api.php", timeout=5,
+            params={"action": "query", "list": "search", "srsearch": query,
+                    "srlimit": n, "format": "json"},
+            headers={"User-Agent": "web-retrieval-agent/0.1 (AMD AI League project)"},
+        )
+        titles = [x["title"] for x in r.json()["query"]["search"]][:n]
+        return ["https://en.wikipedia.org/wiki/" + quote(t.replace(" ", "_")) for t in titles]
+    except Exception as e:
+        if DEBUG:
+            print(f"[open] wikipedia search failed: {e}", flush=True)
+        return []
+
+
 def discover(query):
-    """Hook for candidate sources. Add search-engine / Wikipedia routes here later."""
-    return propose_sites(query)
+    """Candidate start pages. Order: best model guess, best Wikipedia hit, then the rest.
+    Add more routes (search engine, etc.) here."""
+    model, wiki = propose_sites(query), wikipedia_candidates(query)
+    merged, seen = [], set()
+    for u in model[:1] + wiki[:1] + model[1:] + wiki[1:]:
+        if u not in seen:
+            seen.add(u)
+            merged.append(u)
+    return merged[:MAX_TOTAL]
 
 
 def answer_open(query):
