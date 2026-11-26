@@ -86,30 +86,44 @@ except Exception as e:
     print("chromium unavailable, HTTP-only mode:", e, flush=True)
 
 
-def fetch_html(url):
+WIKI_UA = "web-retrieval-agent/0.1 (https://github.com/reemHasan/AMD-MC4-Agent-Web-retrieval)"
+
+
+def fetch_html(url, max_seconds=12):
+    """Plain HTTP first. Chromium only for pages that loaded fine but are nearly empty
+    (JS-rendered). HTTP errors, DNS failures and timeouts return "" immediately."""
+    t0 = time.time()
+    ua = WIKI_UA if urlparse(url).netloc.endswith("wikipedia.org") else "Mozilla/5.0"
     try:
-        r = httpx.get(url, timeout=8, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
-        html = r.text
-        if DEBUG:
-            print(f"[fetch] {url} status={r.status_code} len={len(html)}", flush=True)
-        if len(BeautifulSoup(html, "html.parser").get_text(" ", strip=True)) > 400 or BROWSER is None:
-            return html
+        r = httpx.get(url, timeout=min(5, max_seconds), follow_redirects=True, headers={"User-Agent": ua})
     except Exception as e:
         if DEBUG:
             print(f"[fetch] {url} httpx failed: {e}", flush=True)
-        if BROWSER is None:
-            return ""
+        return ""
+    if DEBUG:
+        print(f"[fetch] {url} status={r.status_code} len={len(r.text)}", flush=True)
+    if r.status_code >= 400:
+        return ""
+    html = r.text
+    thin = len(BeautifulSoup(html, "html.parser").get_text(" ", strip=True)) <= 400
+    left = max_seconds - (time.time() - t0)
+    if not thin or BROWSER is None or left < 3:
+        return html
     try:  # JS-heavy page: render it
         page = BROWSER.new_page()
         try:
-            page.goto(url, timeout=12000, wait_until="networkidle")
+            page.goto(url, timeout=int(min(8, left) * 1000), wait_until="domcontentloaded")
+            try:
+                page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
             return page.content()
         finally:
             page.close()
     except Exception as e:
         if DEBUG:
             print(f"[fetch] {url} chromium failed: {e}", flush=True)
-        return ""
+        return html
 
 
 def parse(url, html):
@@ -189,7 +203,7 @@ def answer(url, query, budget=DEADLINE):
         if time.time() - start > budget or not url or url in visited:
             break
         visited.add(url)
-        text, links = parse(url, fetch_html(url))
+        text, links = parse(url, fetch_html(url, max_seconds=max(3, budget - (time.time() - start))))
         if not text:
             if DEBUG:
                 print(f"[step] empty text for {url}", flush=True)
@@ -250,14 +264,16 @@ def propose_sites(query):
 
 
 def wikipedia_candidates(query, n=2):
-    """Top Wikipedia articles for the question (stable API, allows automated use)."""
+    """Top Wikipedia articles for the question."""
     try:
         r = httpx.get(
             "https://en.wikipedia.org/w/api.php", timeout=5,
             params={"action": "query", "list": "search", "srsearch": query,
                     "srlimit": n, "format": "json"},
-            headers={"User-Agent": "web-retrieval-agent/0.1 (AMD AI League project)"},
+            headers={"User-Agent": WIKI_UA},
         )
+        if r.status_code != 200:
+            raise RuntimeError(f"status {r.status_code}: {r.text[:120]!r}")
         titles = [x["title"] for x in r.json()["query"]["search"]][:n]
         return ["https://en.wikipedia.org/wiki/" + quote(t.replace(" ", "_")) for t in titles]
     except Exception as e:
