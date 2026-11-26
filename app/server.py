@@ -30,9 +30,13 @@ EMPTY = {"answer": "", "citations": []}
 
 SYSTEM = (
     "You extract answers from web pages. Answer ONLY from the page text shown; never use "
-    "outside knowledge. 'value' is the bare value only (e.g. '$49.99', 'Q3 FY27'), never a "
-    "sentence. 'evidence' is an EXACT quote copied from the page text that contains the value. "
-    "If the page does not contain the answer, set found=false and pick the most promising "
+    "outside knowledge.\n"
+    "- 'value': the COMPLETE answer exactly as the page writes it, never a sentence: full names "
+    "('Leonardo da Vinci', not 'Leonardo'), prices with their currency symbol ('$49.99'), "
+    "counts as the bare number ('11').\n"
+    "- 'evidence': the SHORTEST exact quote copied from the page text (one sentence or less, "
+    "under 200 characters) that contains the complete value. Do not paraphrase.\n"
+    "- If the page does not contain the answer, set found=false and pick the most promising "
     "'next_url' from the link list (empty string if none).\n"
     'Reply with ONLY a JSON object: {"found": bool, "value": str, "evidence": str, "next_url": str}'
 )
