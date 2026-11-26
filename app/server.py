@@ -15,13 +15,16 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 SOCK = "/tmp/agent.sock"
 MODEL_DIR = os.environ.get("MC3_MODEL_DIR", "/models/vlm")
 DEBUG = os.environ.get("AGENT_DEBUG") == "1"
+DUMP = os.environ.get("AGENT_DUMP")  # directory: save each prompt sent to the model
+if DUMP:
+    os.makedirs(DUMP, exist_ok=True)
 MAX_STEPS = 6
 DEADLINE = 24          # seconds per question (hard limit is 30)
 CTX_CHARS = 5000       # page text sent to the model per step
 OPEN_BUDGET = 25       # total seconds when no URL is given (discovery + candidates)
 PER_CANDIDATE = 9      # max seconds spent on one candidate start page
 MAX_CANDIDATES = 4      # from the model
-MAX_TOTAL = 5           # after merging with Wikipedia hits
+MAX_TOTAL = 6           # after merging with Wikipedia hits
 
 EMPTY = {"answer": "", "citations": []}
 
@@ -210,6 +213,9 @@ def answer(url, query, budget=DEADLINE):
             break
         link_list = "\n".join(f"- {t} -> {u}" for t, u in rank_links(links, query))
         user = f"Question: {query}\n\nPAGE URL: {url}\nPAGE TEXT:\n{select_context(text, query)}\n\nLINKS:\n{link_list}"
+        if DUMP:
+            with open(f"{DUMP}/ctx_{int(time.time() * 1000)}.txt", "w") as f:
+                f.write(user)
         out = llm_json(SYSTEM, user)
         if DEBUG:
             print(f"[step] url={url} text_len={len(text)} out={out}", flush=True)
@@ -227,10 +233,12 @@ def answer(url, query, budget=DEADLINE):
 
 # ---------------------------------------------------------------- open mode (no URL given)
 SITES_SYSTEM = (
-    "You help locate websites. Given a question, list up to 4 start URLs of official or "
-    "authoritative websites most likely to contain the answer, most likely first. Use a homepage "
-    "or a relevant section URL. This only decides WHERE TO LOOK; do not answer the question.\n"
-    'Reply with ONLY a JSON object: {"urls": ["https://...", "https://..."]}'
+    "You help locate information. Given a question, list up to 4 start URLs of official or "
+    "authoritative websites most likely to contain the answer, most likely first (homepage or "
+    "a relevant section URL), and give the key entity or topic to look up on Wikipedia, with no "
+    "question words (for 'Who wrote Hamlet?' use 'Hamlet'). This only decides WHERE TO LOOK; "
+    "do not answer the question.\n"
+    'Reply with ONLY a JSON object: {"urls": ["https://..."], "search_terms": "..."}'
 )
 
 
@@ -250,17 +258,20 @@ def clean_urls(urls):
 
 
 def propose_sites(query):
-    """Candidate start URLs. The model's knowledge only chooses where to look; every answer
-    must still pass the page-evidence check."""
+    """Returns (candidate urls, wikipedia search terms). The model's knowledge only chooses
+    where to look; every answer must still pass the page-evidence check."""
     for _ in range(2):
-        raw = generate(SITES_SYSTEM, f"Question: {query}", max_new_tokens=120)
+        raw = generate(SITES_SYSTEM, f"Question: {query}", max_new_tokens=160)
         m = re.search(r"\{.*\}", raw, re.S)
         if m:
             try:
-                return clean_urls(json.loads(m.group(0)).get("urls", []))
+                d = json.loads(m.group(0))
+                terms = d.get("search_terms")
+                terms = terms.strip() if isinstance(terms, str) else ""
+                return clean_urls(d.get("urls", [])), (terms or query)
             except Exception:
                 pass
-    return []
+    return [], query
 
 
 def wikipedia_candidates(query, n=2):
@@ -283,14 +294,18 @@ def wikipedia_candidates(query, n=2):
 
 
 def discover(query):
-    """Candidate start pages. Order: best model guess, best Wikipedia hit, then the rest.
+    """Candidate start pages, interleaved: model guess, Wikipedia hit, model guess, ...
     Add more routes (search engine, etc.) here."""
-    model, wiki = propose_sites(query), wikipedia_candidates(query)
+    model, terms = propose_sites(query)
+    wiki = wikipedia_candidates(terms)
+    if DEBUG:
+        print(f"[open] wikipedia terms={terms!r}", flush=True)
     merged, seen = [], set()
-    for u in model[:1] + wiki[:1] + model[1:] + wiki[1:]:
-        if u not in seen:
-            seen.add(u)
-            merged.append(u)
+    for i in range(max(len(model), len(wiki))):
+        for lst in (model, wiki):
+            if i < len(lst) and lst[i] not in seen:
+                seen.add(lst[i])
+                merged.append(lst[i])
     return merged[:MAX_TOTAL]
 
 
